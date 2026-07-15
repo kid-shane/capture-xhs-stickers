@@ -9,6 +9,7 @@ import { CaptureError, isAllowedImageHost, requestHeaders } from "./xhs.mjs";
 const execFileAsync = promisify(execFile);
 const MAX_IMAGE_BYTES = 30 * 1024 * 1024;
 const FEISHU_CHAT_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const FEISHU_POST_MAX_CONTENT_BYTES = 30 * 1024;
 const MAX_REDIRECTS = 4;
 const SIPS_PATH = "/usr/bin/sips";
 const defaultCacheBase = process.env.XDG_CACHE_HOME || join(homedir(), ".cache");
@@ -362,6 +363,43 @@ function idempotencyKey(job, asset) {
   return `xhs-${jobPart}-${asset.index}-${hashPart}`.slice(0, 50);
 }
 
+function batchIdempotencyKey(job, assets, chatId, batchIndex) {
+  const jobPart = String(job.id || "job").replace(/[^A-Za-z0-9]/g, "").slice(0, 12);
+  const digest = createHash("sha256");
+  digest.update(String(chatId || "chat"));
+  for (const asset of assets) {
+    digest.update(`\n${asset.index}:${asset.sha256 || asset.fileName || "image"}`);
+  }
+  return `xhs-${jobPart}-b${batchIndex}-${digest.digest("hex").slice(0, 12)}`.slice(0, 50);
+}
+
+function postContent(uploads) {
+  return JSON.stringify({
+    zh_cn: {
+      content: uploads.map(({ imageKey }) => [{ tag: "img", image_key: imageKey }])
+    }
+  });
+}
+
+function postBatches(uploads) {
+  const batches = [];
+  let current = [];
+  for (const upload of uploads) {
+    const candidate = [...current, upload];
+    if (Buffer.byteLength(postContent(candidate), "utf8") <= FEISHU_POST_MAX_CONTENT_BYTES) {
+      current = candidate;
+      continue;
+    }
+    if (!current.length) {
+      throw new CaptureError("FEISHU_CHAT_POST_TOO_LARGE", "单张图片的飞书富文本消息结构超过 30 KB 上限。");
+    }
+    batches.push(current);
+    current = [upload];
+  }
+  if (current.length) batches.push(current);
+  return batches;
+}
+
 function assertFeishuAssets(assets) {
   for (const asset of assets) {
     if (Number(asset.bytes) > FEISHU_CHAT_MAX_IMAGE_BYTES) {
@@ -379,7 +417,8 @@ function assertFeishuAssets(assets) {
   }
 }
 
-function mappedSendError(error) {
+function mappedSendError(error, phase = "send") {
+  if (error instanceof CaptureError) return error;
   if (error?.code === "ENOENT") {
     return new CaptureError("LARK_CLI_NOT_INSTALLED", "运行环境没有找到 lark-cli，暂时无法发送到飞书群。");
   }
@@ -393,26 +432,15 @@ function mappedSendError(error) {
     return new CaptureError("LARK_BOT_NOT_IN_CHAT", "飞书机器人无法访问配置的收件群，请确认机器人仍在群内。");
   }
   if (/rate|frequency|too many|限流|频率/i.test(combined)) {
-    return new CaptureError("LARK_CHAT_RATE_LIMITED", "飞书发送过快，请稍后重试；幂等窗口内已发送图片不会重复。");
+    return new CaptureError("LARK_CHAT_RATE_LIMITED", "飞书操作过快，请稍后重试；批量消息使用稳定幂等键。");
+  }
+  if (phase === "upload") {
+    return new CaptureError("LARK_IMAGE_UPLOAD_FAILED", "上传图片资源到飞书失败，尚未发送批量消息。");
   }
   return new CaptureError("LARK_CHAT_SEND_FAILED", "发送到飞书收件群失败，请检查机器人配置后重试。");
 }
 
-async function sendAsset(job, asset, chatId, execFileImpl) {
-  const args = [
-    "im",
-    "+messages-send",
-    "--as",
-    "bot",
-    "--chat-id",
-    chatId,
-    "--image",
-    asset.relativePath,
-    "--idempotency-key",
-    idempotencyKey(job, asset),
-    "--format",
-    "json"
-  ];
+async function runChatCommand(job, args, execFileImpl, phase) {
   try {
     const { stdout, stderr } = await execFileImpl("lark-cli", args, {
       cwd: join(CACHE_ROOT, job.id),
@@ -426,9 +454,82 @@ async function sendAsset(job, asset, chatId, execFileImpl) {
     });
     const envelope = parseCliEnvelope(stdout, stderr);
     if (!envelope?.ok) throw Object.assign(new Error("Feishu send failed"), { envelope });
+    return envelope.data || {};
   } catch (error) {
-    throw mappedSendError(error);
+    throw mappedSendError(error, phase);
   }
+}
+
+async function uploadAsset(job, asset, execFileImpl) {
+  const data = await runChatCommand(
+    job,
+    [
+      "im",
+      "images",
+      "create",
+      "--as",
+      "bot",
+      "--data",
+      JSON.stringify({ image_type: "message" }),
+      "--file",
+      asset.relativePath,
+      "--format",
+      "json"
+    ],
+    execFileImpl,
+    "upload"
+  );
+  const imageKey = String(data.image_key || "");
+  if (!imageKey.startsWith("img_")) {
+    throw new CaptureError("LARK_IMAGE_UPLOAD_FAILED", "飞书图片上传没有返回有效的 image_key，尚未发送批量消息。");
+  }
+  return { asset, imageKey };
+}
+
+async function sendSingleAsset(job, asset, chatId, execFileImpl) {
+  return runChatCommand(
+    job,
+    [
+      "im",
+      "+messages-send",
+      "--as",
+      "bot",
+      "--chat-id",
+      chatId,
+      "--image",
+      asset.relativePath,
+      "--idempotency-key",
+      idempotencyKey(job, asset),
+      "--format",
+      "json"
+    ],
+    execFileImpl,
+    "send"
+  );
+}
+
+async function sendAssetBatch(job, uploads, chatId, batchIndex, execFileImpl) {
+  return runChatCommand(
+    job,
+    [
+      "im",
+      "+messages-send",
+      "--as",
+      "bot",
+      "--chat-id",
+      chatId,
+      "--msg-type",
+      "post",
+      "--content",
+      postContent(uploads),
+      "--idempotency-key",
+      batchIdempotencyKey(job, uploads.map(({ asset }) => asset), chatId, batchIndex),
+      "--format",
+      "json"
+    ],
+    execFileImpl,
+    "send"
+  );
 }
 
 export async function exportFeishuChat(job, options = {}, dependencies = {}) {
@@ -439,19 +540,74 @@ export async function exportFeishuChat(job, options = {}, dependencies = {}) {
   if (!chat.chatId) {
     throw new CaptureError("FEISHU_CHAT_NOT_CONFIGURED", "尚未配置飞书收件群，请先运行 configure 命令。");
   }
-  let sentCount = 0;
   const execFileImpl = dependencies.execFileImpl || execFileAsync;
-  for (const asset of assets) {
+  if (assets.length === 1) {
     try {
-      await sendAsset(job, asset, chat.chatId, execFileImpl);
-      sentCount += 1;
+      const sent = await sendSingleAsset(job, assets[0], chat.chatId, execFileImpl);
+      return {
+        target: "feishu-chat",
+        chatName: chat.name,
+        count: 1,
+        messageCount: 1,
+        messageId: sent?.message_id || null
+      };
     } catch (error) {
-      error.details = { sentCount, failedIndex: asset.index, total: assets.length };
-      if (sentCount) error.message = `已发送 ${sentCount}/${assets.length} 张；第 ${asset.index + 1} 张失败。${error.message}`;
+      error.details = { sentCount: 0, failedIndex: assets[0].index, total: 1 };
       throw error;
     }
   }
-  return { target: "feishu-chat", chatName: chat.name, count: sentCount };
+
+  const uploads = [];
+  for (const asset of assets) {
+    try {
+      uploads.push(await uploadAsset(job, asset, execFileImpl));
+    } catch (error) {
+      error.details = {
+        uploadedCount: uploads.length,
+        sentCount: 0,
+        failedIndex: asset.index,
+        total: assets.length,
+        phase: "upload"
+      };
+      if (uploads.length) {
+        error.message = `已上传 ${uploads.length}/${assets.length} 张，但尚未发送消息；第 ${asset.index + 1} 张上传失败。${error.message}`;
+      }
+      throw error;
+    }
+  }
+
+  const messages = [];
+  let sentCount = 0;
+  const batches = postBatches(uploads);
+  for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
+    const batch = batches[batchIndex];
+    try {
+      const sent = await sendAssetBatch(job, batch, chat.chatId, batchIndex, execFileImpl);
+      messages.push({
+        indexes: batch.map(({ asset }) => asset.index),
+        messageId: sent?.message_id || null
+      });
+      sentCount += batch.length;
+    } catch (error) {
+      error.details = {
+        uploadedCount: uploads.length,
+        sentCount,
+        total: assets.length,
+        phase: "send"
+      };
+      error.message = sentCount
+        ? `已批量发送 ${sentCount}/${assets.length} 张；下一批发送失败。${error.message}`
+        : `图片已全部上传，但批量消息未确认发送成功。${error.message}`;
+      throw error;
+    }
+  }
+  return {
+    target: "feishu-chat",
+    chatName: chat.name,
+    count: assets.length,
+    messageCount: messages.length,
+    messageId: messages.length === 1 ? messages[0].messageId : null
+  };
 }
 
 export async function integrationStatus() {
