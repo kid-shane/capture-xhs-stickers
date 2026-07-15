@@ -1,4 +1,4 @@
 interface:
   display_name: "小红书表情包捕获"
-  short_description: "解析小红书整组表情，检查平台水印并发送到飞书收件群"
-  default_prompt: "使用 $capture-xhs-stickers 捕获这个小红书链接里的整组表情包，检查后发送到飞书收件群。"
+  short_description: "解析小红书整组表情，检查平台水印并整批发送到飞书收件群"
+  default_prompt: "使用 $capture-xhs-stickers 捕获这个小红书链接里的整组表情包，检查后用一条批量消息发送到飞书收件群。"

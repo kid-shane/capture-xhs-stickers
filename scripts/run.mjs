@@ -175,10 +175,12 @@ function writeSuccess(data) {
 function writeError(error) {
   const known = error instanceof CaptureError;
   const safeDetails = known && error.details && typeof error.details === "object"
-    ? {
+      ? {
+        uploadedCount: error.details.uploadedCount,
         sentCount: error.details.sentCount,
         failedIndex: error.details.failedIndex,
-        total: error.details.total
+        total: error.details.total,
+        phase: error.details.phase
       }
     : undefined;
   process.stderr.write(
